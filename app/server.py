@@ -1,14 +1,17 @@
 """HTTP review service for snapshot page-ownership audits.
 
 Endpoints:
-  GET  /health           liveness probe
-  GET  /                 review form (HTML)
-  POST /                 form submit, server-rendered verdict (HTML)
-  POST /api/audit        JSON {snapshot_b64, root_page} -> verdict JSON
-  GET  /api/audit/last   most recent verdict (404 before the first submission)
+  GET  /health                liveness probe
+  GET  /                      review form (HTML)
+  POST /                      form submit, server-rendered verdict (HTML)
+  POST /api/audit             JSON {snapshot_b64, root_page} -> verdict JSON
+  GET  /api/audit/last        most recent verdict (404 before the first submission)
+  GET  /api/audit/trace       rowid descent against the latest ACCEPTED verdict
+                              (?rowid=N); 409 once that conclusion is gone
 
 Every submission atomically replaces the stored verdict, so a failed review
-always clears any earlier success conclusion.
+always clears any earlier success conclusion -- including the decoded snapshot
+bytes kept for rowid descent tracing.
 """
 
 from __future__ import annotations
@@ -22,7 +25,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from .sqlite_audit import MAX_SNAPSHOT_BYTES, audit_snapshot
+from .sqlite_audit import MAX_SNAPSHOT_BYTES, audit_snapshot, trace_rowid_path
 
 MAX_BODY_BYTES = 2 * 1024 * 1024
 # Largest base64 string that can decode to <= MAX_SNAPSHOT_BYTES.
@@ -30,6 +33,11 @@ MAX_B64_CHARS = ((MAX_SNAPSHOT_BYTES + 2) // 3) * 4 + 8
 
 _lock = threading.Lock()
 _last_result: dict | None = None
+# Decoded bytes of the latest *accepted* verdict only.  Any rejection (or a
+# newly submitted snapshot) clears them, so a rowid trace can never read an
+# outdated or failed conclusion.
+_last_accepted_data: bytes | None = None
+_last_accepted_root: int | None = None
 
 
 def _rejected(code, message):
@@ -80,17 +88,91 @@ def evaluate(snapshot_b64, root_page) -> dict:
 
 
 def run_audit(snapshot_b64, root_page) -> dict:
-    """Evaluate and atomically replace the stored verdict (clears stale success)."""
-    global _last_result
+    """Evaluate and atomically replace the stored verdict (clears stale success).
+
+    The decoded snapshot bytes are retained only while the current verdict is
+    accepted; any rejection -- and every new submission -- drops the previously
+    retained bytes, so rowid traces can never follow a stale or failed path.
+    """
+    global _last_result, _last_accepted_data, _last_accepted_root
     result = evaluate(snapshot_b64, root_page)
+    accepted_data = None
+    accepted_root = None
+    if result["verdict"] == "accepted":
+        # evaluate() already validated the base64 on this same input; keep the
+        # exact audited bytes for rowid descent tracing.
+        try:
+            accepted_data = base64.b64decode(
+                "".join(snapshot_b64.split()), validate=True
+            )
+        except (binascii.Error, ValueError):  # pragma: no cover - cannot happen
+            accepted_data = None
+        accepted_root = result["root_page"]
     with _lock:
         _last_result = result
+        _last_accepted_data = accepted_data
+        _last_accepted_root = accepted_root
     return result
 
 
 def last_result() -> dict | None:
     with _lock:
         return _last_result
+
+
+def current_accepted() -> tuple[dict, bytes, int] | None:
+    """The current accepted verdict together with its audited bytes, or None."""
+    with _lock:
+        if (
+            _last_result is not None
+            and _last_result["verdict"] == "accepted"
+            and _last_accepted_data is not None
+        ):
+            return _last_result, _last_accepted_data, _last_accepted_root
+    return None
+
+
+def trace_last_accepted(rowid_raw) -> tuple[int, dict]:
+    """Trace one rowid through the latest accepted conclusion only.
+
+    Returns (http_status, payload).  A missing/stale conclusion (nothing
+    submitted yet, last verdict rejected, or a newer snapshot submitted) is a
+    distinguishable 409 -- no path is ever synthesized for an old verdict.
+    """
+    current = current_accepted()
+    if current is None:
+        return (
+            409,
+            {
+                "error": (
+                    "no accepted review conclusion is current; a rowid trace "
+                    "requires the most recent submission to be an accepted one"
+                ),
+                "code": "NO_ACCEPTED_CONCLUSION",
+            },
+        )
+    verdict, data, root = current
+    try:
+        rowid = int(str(rowid_raw).strip())
+    except (TypeError, ValueError, AttributeError):
+        return (
+            422,
+            {
+                "error": "rowid must be an integer",
+                "code": "ROWID_INVALID",
+            },
+        )
+    if not -(1 << 63) <= rowid < (1 << 63):
+        return (
+            422,
+            {
+                "error": "rowid must be a signed 64-bit integer",
+                "code": "ROWID_INVALID",
+            },
+        )
+    trace = trace_rowid_path(data, root, rowid)
+    trace["verdict"] = verdict["verdict"]
+    return 200, trace
 
 
 # ---------------------------------------------------------------------------
@@ -143,7 +225,82 @@ def render_result_html(result: dict | None) -> str:
                 f"<td>{esc(p['referenced_by'])}</td><td>{esc(rng_text)}</td></tr>"
             )
         out.append("</tbody></table>")
+    if verdict == "accepted":
+        out.append(render_trace_form_html())
     out.append("</section>")
+    return "".join(out)
+
+
+def render_trace_form_html() -> str:
+    """Rowid descent query entry; shown only on an accepted verdict page."""
+    return (
+        '<div id="trace-card"><h3>行键抵达路径查询</h3>'
+        "<p>输入行键，沿指定表根的真实子页指针逐页下降，"
+        "查看经过的内部页、采用的指针、半开键界与叶页落点。</p>"
+        '<form id="trace-form" method="get" action="/trace">'
+        '<p>行键（rowid）：<input name="rowid" id="trace-rowid" size="12">'
+        '<button type="submit">查询路径</button></p>'
+        "</form>"
+        '<section id="trace-result"></section></div>'
+    )
+
+
+def _trace_step_rows(trace: dict) -> str:
+    esc = html.escape
+    rows = []
+    for step in trace["path"]:
+        if step["choice"] == "right_most":
+            pointer = f'右子页指针 -> 页 {step["child_page"]}'
+            cell = "-"
+        else:
+            pointer = (
+                f'单元 {step["cell_index"]} 子页指针 -> 页 {step["child_page"]}'
+            )
+            cell = step["cell_index"]
+        rows.append(
+            f'<tr><td>{step["page"]}</td><td>{cell}</td>'
+            f"<td>{esc(pointer)}</td>"
+            f'<td><code>{esc(step["key_bounds_label"])}</code></td>'
+            f'<td>{step["pointer_offset"]}</td></tr>'
+        )
+    if not rows:
+        rows.append('<tr><td colspan="5">表根即叶页，无内部下降步骤</td></tr>')
+    return "".join(rows)
+
+
+def render_trace_html(trace: dict | None, error: str | None = None) -> str:
+    """Server-rendered trace result (mirrors the JSON /api/audit/trace)."""
+    if error:
+        return (
+            '<section id="trace-result"><div id="trace-error" class="trace-miss">'
+            f"<p>{html.escape(error)}</p></div></section>"
+        )
+    esc = html.escape
+    leaf = trace["leaf"]
+    rng = leaf["rowid_range"]
+    rng_text = f"{rng[0]}..{rng[1]}" if rng else "（空叶页）"
+    out = [
+        '<section id="trace-result">',
+        f'<h4>查询行键：<code id="trace-rowid-value">{trace["rowid"]}</code></h4>',
+        f'<p id="trace-outcome" data-outcome="{esc(trace["outcome"])}">'
+        f"结论：<b>{esc(trace['outcome'])}</b></p>",
+        f'<p id="trace-message">{esc(trace["message"])}</p>',
+        '<table id="trace-path-table"><thead><tr>'
+        "<th>当前页</th><th>单元</th><th>采用的子页指针</th>"
+        "<th>半开键界</th><th>指针原始偏移</th>"
+        "</tr></thead><tbody>",
+        _trace_step_rows(trace),
+        "</tbody></table>",
+        '<div id="trace-leaf-card"><h4>叶页落点</h4><dl>',
+        f'<dt>叶页</dt><dd id="trace-leaf-page">{leaf["page"]}</dd>',
+        f"<dt>叶页完整行键范围</dt><dd>{esc(rng_text)}</dd>",
+        "<dt>叶内全部行键</dt>"
+        f'<dd id="trace-leaf-rowids">{esc(", ".join(map(str, leaf["rowids"]))) or "-"}</dd>',
+        f'<dt>是否存在精确单元</dt><dd id="trace-exact-cell">'
+        f'{"是" if leaf["exact_cell"] else "否"}</dd>',
+        "</dl></div>",
+        "</section>",
+    ]
     return "".join(out)
 
 
@@ -161,6 +318,9 @@ table { border-collapse: collapse; margin-top: 1rem; }
 th, td { border: 1px solid #ccc; padding: 4px 8px; font-size: 14px; }
 code { background: #f2f2f2; padding: 1px 4px; }
 #error-card { border: 1px solid #b00020; padding: 0.5rem 1rem; margin-top: 1rem; }
+#trace-card { border: 1px solid #0a7d2c; padding: 0.5rem 1rem; margin-top: 1rem; }
+.trace-miss { border: 1px solid #b06a00; padding: 0.5rem 1rem; margin-top: 0.5rem; }
+#trace-path-table td code { background: none; }
 </style>
 </head>
 <body>
@@ -195,8 +355,57 @@ function renderResult(res) {
     }
     h += '</tbody></table>';
   }
+  if (res.verdict === 'accepted') {
+    h += '<div id="trace-card"><h3>行键抵达路径查询</h3>'
+      + '<p>输入行键，沿指定表根的真实子页指针逐页下降，查看经过的内部页、采用的指针、半开键界与叶页落点。</p>'
+      + '<form id="trace-form" method="get" action="/trace">'
+      + '<p>行键（rowid）：<input name="rowid" id="trace-rowid" size="12">'
+      + '<button type="submit">查询路径</button></p>'
+      + '<section id="trace-result"></section></div>';
+  }
   document.getElementById('result').innerHTML = h;
 }
+function renderTrace(res) {
+  let h = `<h4>查询行键：<code id="trace-rowid-value">${esc(res.rowid)}</code></h4>`
+    + `<p id="trace-outcome" data-outcome="${esc(res.outcome)}">结论：<b>${esc(res.outcome)}</b></p>`
+    + `<p id="trace-message">${esc(res.message)}</p>`;
+  h += '<table id="trace-path-table"><thead><tr><th>当前页</th><th>单元</th><th>采用的子页指针</th><th>半开键界</th><th>指针原始偏移</th></tr></thead><tbody>';
+  if (!res.path.length) {
+    h += '<tr><td colspan="5">表根即叶页，无内部下降步骤</td></tr>';
+  }
+  for (const s of res.path) {
+    const cell = s.choice === 'right_most' ? '-' : s.cell_index;
+    const ptr = s.choice === 'right_most'
+      ? `右子页指针 -> 页 ${s.child_page}`
+      : `单元 ${s.cell_index} 子页指针 -> 页 ${s.child_page}`;
+    h += `<tr><td>${s.page}</td><td>${cell}</td><td>${esc(ptr)}</td>`
+      + `<td><code>${esc(s.key_bounds_label)}</code></td><td>${s.pointer_offset}</td></tr>`;
+  }
+  h += '</tbody></table>';
+  const leaf = res.leaf;
+  const rng = leaf.rowid_range ? `${leaf.rowid_range[0]}..${leaf.rowid_range[1]}` : '（空叶页）';
+  h += '<div id="trace-leaf-card"><h4>叶页落点</h4><dl>'
+    + `<dt>叶页</dt><dd id="trace-leaf-page">${leaf.page}</dd>`
+    + `<dt>叶页完整行键范围</dt><dd>${esc(rng)}</dd>`
+    + `<dt>叶内全部行键</dt><dd id="trace-leaf-rowids">${esc(leaf.rowids.join(', ')) || '-'}</dd>`
+    + `<dt>是否存在精确单元</dt><dd id="trace-exact-cell">${leaf.exact_cell ? '是' : '否'}</dd>`
+    + '</dl></div>';
+  return h;
+}
+document.addEventListener('submit', async (ev) => {
+  if (ev.target.id !== 'trace-form') return;
+  ev.preventDefault();
+  const rowid = document.getElementById('trace-rowid').value;
+  const resp = await fetch('/api/audit/trace?rowid=' + encodeURIComponent(rowid));
+  const payload = await resp.json();
+  const box = document.getElementById('trace-result');
+  if (!resp.ok) {
+    box.innerHTML = '<div id="trace-error" class="trace-miss"><p>'
+      + esc(payload.error || 'trace unavailable') + '</p></div>';
+    return;
+  }
+  box.innerHTML = renderTrace(payload);
+});
 document.getElementById('audit-form').addEventListener('submit', async (ev) => {
   ev.preventDefault();
   const resp = await fetch('/api/audit', {
@@ -246,7 +455,8 @@ class Handler(BaseHTTPRequestHandler):
         self._send(text.encode("utf-8"), status, "text/html; charset=utf-8")
 
     def do_GET(self):
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        path = parsed.path
         if path == "/health":
             self._send_json({"status": "ok"})
         elif path == "/":
@@ -257,8 +467,35 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"error": "no audit submitted yet"}, 404)
             else:
                 self._send_json(result)
+        elif path == "/api/audit/trace":
+            query = parse_qs(parsed.query)
+            status, payload = trace_last_accepted(query.get("rowid", [""])[0])
+            self._send_json(payload, status)
+        elif path == "/trace":
+            self._send_html(*self._render_trace_page(parsed.query))
         else:
             self._send_json({"error": "not found"}, 404)
+
+    def _render_trace_page(self, query: str):
+        """Full-page rowid trace (progressive enhancement of the JSON API)."""
+        rowid_raw = parse_qs(query).get("rowid", [""])[0]
+        status, payload = trace_last_accepted(rowid_raw)
+        current = current_accepted()
+        result = current[0] if current else last_result()
+        page = render_page(result)
+        fragment = (
+            render_trace_html(payload)
+            if status == 200
+            else render_trace_html(None, payload["error"])
+        )
+        placeholder = '<section id="trace-result"></section>'
+        if placeholder in page:
+            page = page.replace(placeholder, fragment)
+        else:
+            # No accepted verdict rendered (no trace card): show the standalone
+            # result/error above the page script.
+            page = page.replace("<script>", fragment + "<script>", 1)
+        return page, status
 
     def do_POST(self):
         path = urlparse(self.path).path

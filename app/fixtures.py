@@ -211,6 +211,50 @@ def valid_snapshot():
     return b.build(), ROOT_PAGE
 
 
+def trace_gap_snapshot():
+    """Accepted snapshot whose rowid space contains two kinds of verifiable gaps.
+
+    Same 12-page shell as ``valid_snapshot`` (freelist trunk 8 -> leaves 9,10),
+    but the audited tree has no overflow payload and deliberate rowid gaps:
+
+      page 3 (leaf) holds rowids 1, 2, 4 -> span 1..4; rowid 3 is missing
+                 *inside* the reached leaf (outcome ``leaf_missing``);
+      page 4 (leaf) holds rowids 6, 7, 8 -> span 6..8; rowid 5 falls in the
+                 gap between the separator boundaries (page 11 divider key 4)
+                 and no leaf covers it (outcome ``between_separator_keys``);
+      page 5 (leaf) holds rowids 9..12.
+
+    Divider keys stay legal: page 11 key 4 is >= the left subtree max 4 and
+    below the right subtree min 6; the root key 8 keeps 8 < 9.  The whole-tree
+    range remains 1..12, so rowids 0 and 13 stay ``outside_tree``.
+    """
+    b = SnapshotBuilder()
+    b.add_table_leaf(
+        1, [(1, b"sqlite-master placeholder record")], first_page=True
+    )
+    b.add_table_leaf(3, [(1, b"tm-0001"), (2, b"tm-0002"), (4, b"tm-0004")])
+    b.add_table_leaf(4, [(6, b"tm-0006"), (7, b"tm-0007"), (8, b"tm-0008")])
+    b.add_table_leaf(5, [(i, b"tm-%04d" % i) for i in (9, 10, 11, 12)])
+    b.add_table_interior(11, [4], [3, 4])
+    b.add_table_interior(2, [8], [11, 5])
+    b.add_freelist_trunk(8, 0, [9, 10])
+    b.freelist_head = 8
+    b.freelist_count = 3
+    return b.build(), ROOT_PAGE
+
+
+def second_valid_snapshot():
+    """A distinct, smaller accepted snapshot used to prove conclusion turnover.
+
+    Root page 2 is itself a leaf holding rowids 100 and 200, so any rowid
+    query answered from this conclusion (e.g. the old tree's rowid 7) must be
+    evaluated against this tree, never the previously submitted one.
+    """
+    b = SnapshotBuilder(page_size=PAGE_SIZE, page_count=2)
+    b.add_table_leaf(2, [(100, b"second-100"), (200, b"second-200")])
+    return b.build(), 2
+
+
 def invalid_scenarios():
     """name -> (snapshot, root_page, expected_code, expected_page, expected_offset).
 

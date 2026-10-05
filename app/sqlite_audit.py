@@ -42,6 +42,24 @@ LIVE_KINDS = frozenset({KIND_ROOT, KIND_INTERIOR, KIND_LEAF, KIND_OVERFLOW})
 # the guard only stops pathological inputs before Python's recursion limit.
 MAX_BTREE_DEPTH = 4000
 
+# Rowid-descent trace outcomes.
+TRACE_FOUND = "found"
+TRACE_LEAF_MISSING = "leaf_missing"
+TRACE_BETWEEN_KEYS = "between_separator_keys"
+TRACE_OUTSIDE_TREE = "outside_tree"
+
+
+def format_key_interval(lower, upper) -> str:
+    """Half-open interval (lower, upper] implied by adjacent divider keys.
+
+    A table interior cell steers rowids <= its divider key into the left
+    child and larger rowids into the next child, so the bounds are
+    lower-exclusive and upper-inclusive.
+    """
+    lo = "-inf" if lower is None else lower
+    up = "+inf" if upper is None else upper
+    return f"({lo}, {up}]"
+
 
 @dataclass
 class AuditError:
@@ -726,3 +744,193 @@ def audit_snapshot(data: bytes, root_page: int) -> dict:
     except Reject as reject:
         return auditor.result("rejected", reject.error)
     return auditor.result("accepted", None)
+
+
+def _read_interior_descriptors(auditor: Auditor, pgno: int):
+    """Return (entries, right_child, right_offset) for a table interior page.
+
+    Entries are ordered like the cell pointer array:
+    {"cell_index", "child_page", "divider_key", "pointer_offset"}.
+    """
+    base = auditor.page_base(pgno)
+    hdr = base + (100 if pgno == 1 else 0)
+    page_end = base + auditor.page_size
+    ncells = auditor.u16(hdr + 3)
+    entries = []
+    for i in range(ncells):
+        slot_off = hdr + 12 + 2 * i
+        coff = base + auditor.u16(slot_off)
+        child = auditor.u32(coff)
+        key_raw, _ = auditor.read_varint(
+            coff + 4, page_end, pgno, f"cell {i} divider key"
+        )
+        entries.append(
+            {
+                "cell_index": i,
+                "child_page": child,
+                "divider_key": to_signed64(key_raw),
+                "pointer_offset": coff,
+                "pointer_slot_offset": slot_off,
+            }
+        )
+    return entries, auditor.u32(hdr + 8), hdr + 8
+
+
+def _read_leaf_cells(auditor: Auditor, pgno: int) -> list[dict]:
+    """Ordered leaf cells: {cell_index, rowid, cell_offset, pointer_slot_offset}."""
+    base = auditor.page_base(pgno)
+    hdr = base + (100 if pgno == 1 else 0)
+    page_end = base + auditor.page_size
+    ncells = auditor.u16(hdr + 3)
+    cells = []
+    for i in range(ncells):
+        slot_off = hdr + 8 + 2 * i
+        coff = base + auditor.u16(slot_off)
+        _, o = auditor.read_varint(coff, page_end, pgno, f"cell {i} payload length")
+        rowid_raw, _ = auditor.read_varint(o, page_end, pgno, f"cell {i} rowid")
+        cells.append(
+            {
+                "cell_index": i,
+                "rowid": to_signed64(rowid_raw),
+                "cell_offset": coff,
+                "pointer_slot_offset": slot_off,
+            }
+        )
+    return cells
+
+
+def trace_rowid_path(data: bytes, root_page: int, rowid: int) -> dict:
+    """Trace the ordered descent of one rowid from a table root to its leaf.
+
+    The snapshot is re-audited first: tracing is only available for snapshots
+    whose review verdict is "accepted", so every pointer followed below has
+    already passed structural validation.  The trace follows the raw child
+    pointers actually stored in the interior pages (never the summary rowid
+    ranges) and records, per level, the current page, the child pointer taken,
+    the half-open key bounds ``(lower_key, upper_key]`` implied by the adjacent
+    divider keys, and the child pointer's absolute offset in the snapshot.
+
+    Outcomes are distinguishable:
+      * found                    - an exact cell exists on the reached leaf;
+      * leaf_missing             - inside the tree, inside the reached leaf's
+                                   rowid span, but no exact cell;
+      * between_separator_keys   - the descent interval contains no leaf cell
+                                   (a gap between two separator boundaries);
+      * outside_tree             - below/above the whole tree's rowid range.
+    """
+    verdict = audit_snapshot(data, root_page)
+    if verdict["verdict"] != "accepted":
+        raise ValueError("rowid trace is only available for accepted snapshots")
+
+    auditor = Auditor(data, root_page)
+    auditor.parse_header()
+
+    steps = []
+    pgno = root_page
+    depth = 0
+    while True:
+        if depth > MAX_BTREE_DEPTH:
+            raise ValueError("b-tree nesting exceeds the reviewed depth limit")
+        base = auditor.page_base(pgno)
+        ptype = auditor.data[base + (100 if pgno == 1 else 0)]
+        if ptype == PAGE_TYPE_LEAF_TABLE:
+            leaf_pgno = pgno
+            break
+        entries, right_child, right_offset = _read_interior_descriptors(auditor, pgno)
+
+        chosen_pos = None
+        for i, entry in enumerate(entries):
+            if rowid <= entry["divider_key"]:
+                chosen_pos = i
+                break
+        if chosen_pos is None:
+            entry = entries[-1] if entries else None
+            step = {
+                "page": pgno,
+                "choice": "right_most",
+                "cell_index": None,
+                "child_page": right_child,
+                "divider_key": None,
+                "lower_key": entry["divider_key"] if entry else None,
+                "upper_key": None,
+                "pointer_offset": right_offset,
+                "pointer_slot_offset": right_offset,
+            }
+        else:
+            entry = entries[chosen_pos]
+            prev_entry = entries[chosen_pos - 1] if chosen_pos > 0 else None
+            step = {
+                "page": pgno,
+                "choice": "cell",
+                "cell_index": entry["cell_index"],
+                "child_page": entry["child_page"],
+                "divider_key": entry["divider_key"],
+                "lower_key": prev_entry["divider_key"] if prev_entry else None,
+                "upper_key": entry["divider_key"],
+                "pointer_offset": entry["pointer_offset"],
+                "pointer_slot_offset": entry["pointer_slot_offset"],
+            }
+        step["key_bounds"] = [step["lower_key"], step["upper_key"]]
+        step["key_bounds_label"] = format_key_interval(
+            step["lower_key"], step["upper_key"]
+        )
+        steps.append(step)
+        pgno = step["child_page"]
+        depth += 1
+
+    cells = _read_leaf_cells(auditor, leaf_pgno)
+    rowids = [c["rowid"] for c in cells]
+    exact = next((c for c in cells if c["rowid"] == rowid), None)
+    lo = rowids[0] if rowids else None
+    hi = rowids[-1] if rowids else None
+    tree_min = verdict["summary"]["rowid_min"]
+    tree_max = verdict["summary"]["rowid_max"]
+
+    if exact is not None:
+        outcome = TRACE_FOUND
+    elif tree_min is None or rowid < tree_min or rowid > tree_max:
+        outcome = TRACE_OUTSIDE_TREE
+    elif lo is not None and lo <= rowid <= hi:
+        outcome = TRACE_LEAF_MISSING
+    else:
+        outcome = TRACE_BETWEEN_KEYS
+
+    messages = {
+        TRACE_FOUND: (
+            f"rowid {rowid}: page {root_page} -> ... -> leaf page {leaf_pgno} "
+            f"holds an exact cell (cell {exact['cell_index'] if exact else '-'})"
+        ),
+        TRACE_LEAF_MISSING: (
+            f"rowid {rowid} lies inside leaf page {leaf_pgno}'s rowid span "
+            f"{lo}..{hi}, but the leaf contains no cell with that rowid"
+        ),
+        TRACE_BETWEEN_KEYS: (
+            f"rowid {rowid} falls between two separator boundaries; the descent "
+            f"reaches leaf page {leaf_pgno} (rowids {lo}..{hi}) which holds no "
+            f"such cell"
+        ),
+        TRACE_OUTSIDE_TREE: (
+            f"rowid {rowid} is outside the audited tree's whole rowid range "
+            f"{tree_min}..{tree_max}; no leaf can hold it"
+        ),
+    }
+
+    return {
+        "rowid": rowid,
+        "root_page": root_page,
+        "outcome": outcome,
+        "tree_rowid_range": [tree_min, tree_max] if tree_min is not None else None,
+        "path": steps,
+        "leaf": {
+            "page": leaf_pgno,
+            "rowid_range": [lo, hi] if lo is not None else None,
+            "rowids": rowids,
+            "cell_count": len(cells),
+            "exact_cell": exact is not None,
+            "exact_cell_index": exact["cell_index"] if exact else None,
+            "cell_pointer_slot_offset": (
+                exact["pointer_slot_offset"] if exact else None
+            ),
+        },
+        "message": messages[outcome],
+    }
