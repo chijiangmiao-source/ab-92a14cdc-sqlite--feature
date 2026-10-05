@@ -10,6 +10,7 @@ import urllib.request
 from http.server import ThreadingHTTPServer
 
 from app import fixtures
+from app import server as server_module
 from app.fixtures import valid_snapshot
 from app.server import Handler
 
@@ -37,6 +38,10 @@ class ServerTests(unittest.TestCase):
                 return resp.status, resp.read()
         except urllib.error.HTTPError as exc:
             return exc.code, exc.read()
+
+    def get_json(self, path):
+        status, body = self.get(path)
+        return status, json.loads(body)
 
     def post_json(self, payload):
         req = urllib.request.Request(
@@ -148,6 +153,116 @@ class ServerTests(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as ctx:
             urllib.request.urlopen(req)
         self.assertEqual(ctx.exception.code, 400)
+
+    # --- row-key path queries ------------------------------------------------
+
+    def test_rowid_path_multi_level_hit(self):
+        data, root = valid_snapshot()
+        status, res = self.post_json({"snapshot_b64": b64(data), "root_page": root})
+        self.assertEqual(res["verdict"], "accepted")
+        status, res = self.get_json("/api/audit/last/path?rowid=7")
+        self.assertEqual(status, 200)
+        self.assertEqual(res["conclusion"], "hit")
+        self.assertEqual(res["root_page"], root)
+        self.assertEqual([s["page"] for s in res["path"]], [2, 11])
+        self.assertEqual([s["child_page"] for s in res["path"]], [11, 4])
+        first, second = res["path"]
+        self.assertEqual(first["via"], "cell")
+        self.assertIsNone(first["key_lower"])
+        self.assertEqual(first["key_upper"], 8)
+        self.assertEqual(second["via"], "rightmost")
+        self.assertEqual(second["key_lower"], 4)
+        self.assertIsNone(second["key_upper"])
+        # Step offsets point at the raw child pointers in the submitted snapshot.
+        for step in res["path"]:
+            off = step["pointer_offset"]
+            self.assertEqual(int.from_bytes(data[off : off + 4], "big"), step["child_page"])
+        self.assertEqual(
+            res["leaf"], {"page": 4, "rowid_range": [5, 8], "exact_cell": True}
+        )
+
+    def test_rowid_path_misses_are_distinguishable(self):
+        data, root = fixtures.gapped_snapshot()
+        status, res = self.post_json({"snapshot_b64": b64(data), "root_page": root})
+        self.assertEqual(res["verdict"], "accepted")
+        status, res = self.get_json("/api/audit/last/path?rowid=11")
+        self.assertEqual(res["conclusion"], "leaf_miss")
+        self.assertEqual(res["leaf"]["exact_cell"], False)
+        self.assertEqual(res["leaf"]["rowid_range"], [9, 12])
+        status, res = self.get_json("/api/audit/last/path?rowid=5")
+        self.assertEqual(res["conclusion"], "no_leaf")
+        self.assertEqual(res["path"], [])
+        self.assertIsNone(res["leaf"])
+        status, res = self.get_json("/api/audit/last/path?rowid=99")
+        self.assertEqual(res["conclusion"], "out_of_range")
+        self.assertEqual(res["path"], [])
+        self.assertIsNone(res["leaf"])
+
+    def test_rowid_path_not_served_after_rejection(self):
+        data, root = valid_snapshot()
+        self.post_json({"snapshot_b64": b64(data), "root_page": root})
+        status, _ = self.get_json("/api/audit/last/path?rowid=7")
+        self.assertEqual(status, 200)
+        bad, bad_root, *_ = fixtures.invalid_scenarios()["bad_magic"]
+        status, res = self.post_json({"snapshot_b64": b64(bad), "root_page": bad_root})
+        self.assertEqual(res["verdict"], "rejected")
+        status, _ = self.get_json("/api/audit/last/path?rowid=7")
+        self.assertEqual(status, 404)
+
+    def test_rowid_path_reflects_only_latest_snapshot(self):
+        data, root = valid_snapshot()
+        self.post_json({"snapshot_b64": b64(data), "root_page": root})
+        status, res = self.get_json("/api/audit/last/path?rowid=5")
+        self.assertEqual(res["conclusion"], "hit")
+        # Submitting another snapshot retires the previous conclusions.
+        gdata, groot = fixtures.gapped_snapshot()
+        self.post_json({"snapshot_b64": b64(gdata), "root_page": groot})
+        status, res = self.get_json("/api/audit/last/path?rowid=5")
+        self.assertEqual(res["conclusion"], "no_leaf")
+
+    def test_rowid_path_404_without_accepted_conclusion(self):
+        # Simulate the never-submitted state, then restore the shared state.
+        with server_module._lock:
+            saved = (server_module._last_result, server_module._last_index)
+            server_module._last_result = None
+            server_module._last_index = None
+        try:
+            status, _ = self.get_json("/api/audit/last/path?rowid=1")
+            self.assertEqual(status, 404)
+        finally:
+            with server_module._lock:
+                server_module._last_result, server_module._last_index = saved
+
+    def test_rowid_path_param_validation(self):
+        data, root = valid_snapshot()
+        self.post_json({"snapshot_b64": b64(data), "root_page": root})
+        for query in ("", "?rowid=", "?rowid=abc", "?rowid=1.5", "?rowid=7_0"):
+            with self.subTest(query=query):
+                status, _ = self.get_json("/api/audit/last/path" + query)
+                self.assertEqual(status, 400)
+        status, res = self.get_json("/api/audit/last/path?rowid=-3")
+        self.assertEqual(status, 200)
+        self.assertEqual(res["conclusion"], "out_of_range")
+
+    def test_accepted_page_offers_rowid_query_entry(self):
+        def result_section(html_text):
+            # The JS template string also mentions the entry markup; only the
+            # server-rendered result section tells whether the entry is shown.
+            return html_text.split('<section id="result">', 1)[1].split("</section>", 1)[0]
+
+        data, root = valid_snapshot()
+        status, html_text = self.post_form(
+            {"snapshot_b64": b64(data), "root_page": str(root)}
+        )
+        self.assertEqual(status, 200)
+        self.assertIn('id="path-query"', result_section(html_text))
+        self.assertIn('id="rowid-input"', result_section(html_text))
+        bad, bad_root, *_ = fixtures.invalid_scenarios()["bad_magic"]
+        status, html_text = self.post_form(
+            {"snapshot_b64": b64(bad), "root_page": str(bad_root)}
+        )
+        self.assertEqual(status, 422)
+        self.assertNotIn('id="path-query"', result_section(html_text))
 
 
 if __name__ == "__main__":

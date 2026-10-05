@@ -4,7 +4,11 @@ import unittest
 
 from app import fixtures
 from app.fixtures import PAGE_SIZE, SnapshotBuilder, _base_builder, valid_snapshot
-from app.sqlite_audit import audit_snapshot
+from app.sqlite_audit import (
+    audit_snapshot,
+    audit_snapshot_with_index,
+    resolve_rowid_path,
+)
 
 
 class ValidSnapshotTests(unittest.TestCase):
@@ -360,6 +364,134 @@ class PageSizeTests(unittest.TestCase):
         self.assertEqual(res["verdict"], "accepted", res["error"])
         kinds = {p["page"]: p["kind"] for p in res["pages"]}
         self.assertEqual(kinds, {1: "btree_root"})
+
+
+class RowidPathTests(unittest.TestCase):
+    """Root-to-leaf path resolution from an accepted audit's route index."""
+
+    def accepted_index(self, data, root):
+        result, index = audit_snapshot_with_index(data, root)
+        self.assertEqual(result["verdict"], "accepted", result["error"])
+        return index
+
+    def test_multi_level_hit_reports_full_path(self):
+        b, meta = _base_builder()
+        data = b.build()
+        index = self.accepted_index(data, 2)
+        res = resolve_rowid_path(index, 7)
+        self.assertEqual(res["conclusion"], "hit")
+        self.assertEqual(res["root_page"], 2)
+        self.assertEqual(res["tree_rowid_range"], [1, 12])
+        steps = res["path"]
+        self.assertEqual([s["page"] for s in steps], [2, 11])
+        self.assertEqual([s["child_page"] for s in steps], [11, 4])
+        first, second = steps
+        self.assertEqual(first["page_kind"], "btree_root")
+        self.assertEqual(first["via"], "cell")
+        self.assertEqual(first["cell_index"], 0)
+        self.assertEqual(first["divider_key"], 8)
+        self.assertIsNone(first["key_lower"])
+        self.assertEqual(first["key_upper"], 8)
+        self.assertEqual(first["pointer_offset"], PAGE_SIZE + meta["root"]["ptrs"][0])
+        self.assertEqual(second["page_kind"], "btree_interior")
+        self.assertEqual(second["via"], "rightmost")
+        self.assertIsNone(second["cell_index"])
+        self.assertIsNone(second["divider_key"])
+        self.assertEqual(second["key_lower"], 4)
+        self.assertIsNone(second["key_upper"])
+        self.assertEqual(second["pointer_offset"], 10 * PAGE_SIZE + 8)
+        # Every step offset locates the raw child pointer in the snapshot.
+        for step in steps:
+            off = step["pointer_offset"]
+            self.assertEqual(int.from_bytes(data[off : off + 4], "big"), step["child_page"])
+        self.assertEqual(
+            res["leaf"], {"page": 4, "rowid_range": [5, 8], "exact_cell": True}
+        )
+
+    def test_rightmost_and_leftmost_descents(self):
+        data, root = valid_snapshot()
+        index = self.accepted_index(data, root)
+        res = resolve_rowid_path(index, 12)
+        self.assertEqual(res["conclusion"], "hit")
+        self.assertEqual([s["page"] for s in res["path"]], [2])
+        step = res["path"][0]
+        self.assertEqual(step["via"], "rightmost")
+        self.assertEqual(step["key_lower"], 8)
+        self.assertIsNone(step["key_upper"])
+        self.assertEqual(step["pointer_offset"], PAGE_SIZE + 8)
+        self.assertEqual(res["leaf"]["page"], 5)
+
+        res = resolve_rowid_path(index, 1)
+        self.assertEqual([s["page"] for s in res["path"]], [2, 11])
+        self.assertEqual(res["path"][1]["via"], "cell")
+        self.assertEqual(res["path"][1]["divider_key"], 4)
+        self.assertEqual(res["leaf"]["page"], 3)
+
+    def test_in_leaf_miss_keeps_path_and_leaf_range(self):
+        data, root = fixtures.gapped_snapshot()
+        index = self.accepted_index(data, root)
+        res = resolve_rowid_path(index, 11)
+        self.assertEqual(res["conclusion"], "leaf_miss")
+        self.assertEqual(
+            res["leaf"], {"page": 5, "rowid_range": [9, 12], "exact_cell": False}
+        )
+        self.assertEqual([s["page"] for s in res["path"]], [2])
+        res = resolve_rowid_path(index, 3)
+        self.assertEqual(res["conclusion"], "leaf_miss")
+        self.assertEqual(res["leaf"]["page"], 3)
+        self.assertEqual(res["leaf"]["rowid_range"], [1, 4])
+        self.assertEqual([s["page"] for s in res["path"]], [2, 11])
+
+    def test_gap_between_dividers_has_no_leaf_and_no_path(self):
+        data, root = fixtures.gapped_snapshot()
+        index = self.accepted_index(data, root)
+        res = resolve_rowid_path(index, 5)
+        self.assertEqual(res["conclusion"], "no_leaf")
+        self.assertEqual(res["path"], [])
+        self.assertIsNone(res["leaf"])
+
+    def test_out_of_tree_range_has_no_path(self):
+        data, root = valid_snapshot()
+        index = self.accepted_index(data, root)
+        for rowid in (0, -9, 13, 10**20):
+            with self.subTest(rowid=rowid):
+                res = resolve_rowid_path(index, rowid)
+                self.assertEqual(res["conclusion"], "out_of_range")
+                self.assertEqual(res["path"], [])
+                self.assertIsNone(res["leaf"])
+
+    def test_root_leaf_tree_resolves_with_empty_path(self):
+        b = SnapshotBuilder(page_size=512, page_count=2)
+        b.add_table_leaf(2, [(1, b"x"), (3, b"y")])
+        index = self.accepted_index(b.build(), 2)
+        res = resolve_rowid_path(index, 3)
+        self.assertEqual(res["conclusion"], "hit")
+        self.assertEqual(res["path"], [])
+        self.assertEqual(
+            res["leaf"], {"page": 2, "rowid_range": [1, 3], "exact_cell": True}
+        )
+        res = resolve_rowid_path(index, 2)
+        self.assertEqual(res["conclusion"], "leaf_miss")
+        self.assertEqual(res["leaf"]["exact_cell"], False)
+
+    def test_empty_tree_is_out_of_range(self):
+        b = SnapshotBuilder(page_size=512, page_count=2)
+        b.add_table_leaf(2, [])
+        index = self.accepted_index(b.build(), 2)
+        res = resolve_rowid_path(index, 1)
+        self.assertEqual(res["conclusion"], "out_of_range")
+        self.assertIsNone(res["tree_rowid_range"])
+
+    def test_rejected_audit_yields_no_route_index(self):
+        data, root, *_ = fixtures.invalid_scenarios()["bad_magic"]
+        result, index = audit_snapshot_with_index(data, root)
+        self.assertEqual(result["verdict"], "rejected")
+        self.assertIsNone(index)
+
+    def test_resolution_is_deterministic(self):
+        data, root = valid_snapshot()
+        index = self.accepted_index(data, root)
+        self.assertEqual(resolve_rowid_path(index, 7), resolve_rowid_path(index, 7))
 
 
 if __name__ == "__main__":

@@ -30,7 +30,8 @@
 **首个违规证据**：审计按确定顺序（头部 → B-tree 中序 → 溢出链 → 空闲链）
 在首个违规处停止，稳定报告 `page`（页面号）、`offset`（绝对文件偏移）与
 `bytes_hex`（该处原始字节）。每次提交都会原子替换服务端保存的结论——
-失败的复核会清除旧的成功结论（`GET /api/audit/last` 可验证）。
+失败的复核会清除旧的成功结论（`GET /api/audit/last` 可验证）。行键路径
+查询仅引用最近一次**通过**的结论（见下文「行键路径查询」）。
 
 ## 运行
 
@@ -60,6 +61,7 @@ docker compose down
 | POST | `/` | 表单提交（`snapshot_b64`, `root_page`），HTML 裁决页 |
 | POST | `/api/audit` | JSON 提交；200 接受 / 422 拒绝 |
 | GET | `/api/audit/last` | 最近一次裁决（首次提交前 404） |
+| GET | `/api/audit/last/path?rowid=N` | 行键路径查询，仅基于最近一次**通过**的裁决（无通过结论时 404） |
 
 `POST /api/audit` 请求体：
 
@@ -93,6 +95,51 @@ docker compose down
 }
 ```
 
+## 行键路径查询
+
+快照通过复核后，成功裁决页会提供行键查询入口；复核员输入行键（rowid），
+即可确认 SQLite 实际会经由哪些表内部页与分隔键抵达哪张叶页，而不是只凭
+汇总行键范围推断记录位置：
+
+```
+GET /api/audit/last/path?rowid=7
+```
+
+查询只引用最近一次**通过**的复核结论：失败裁决、首次尚未提交、或提交另
+一份快照之后，旧路径一律不可读取（404）。`rowid` 缺失或非整数时返回 400。
+
+命中时返回从指定表根到目标叶页的有序路径。每一步说明：当前页、采用的
+子页指针（分隔单元或最右指针）、相邻分隔键形成的半开键界
+`(key_lower, key_upper]`（`null` 表示该侧无界），以及该指针在快照中的
+原始文件偏移：
+
+```json
+{
+  "root_page": 2,
+  "rowid": 7,
+  "tree_rowid_range": [1, 12],
+  "conclusion": "hit",
+  "path": [
+    {"page": 2, "page_kind": "btree_root", "via": "cell", "cell_index": 0,
+     "divider_key": 8, "child_page": 11, "pointer_offset": 2043,
+     "key_lower": null, "key_upper": 8},
+    {"page": 11, "page_kind": "btree_interior", "via": "rightmost",
+     "cell_index": null, "divider_key": null, "child_page": 4,
+     "pointer_offset": 10248, "key_lower": 4, "key_upper": null}
+  ],
+  "leaf": {"page": 4, "rowid_range": [5, 8], "exact_cell": true}
+}
+```
+
+`conclusion` 取值（未命中可区分，且绝不伪造路径）：
+
+| 结论 | 含义 |
+| --- | --- |
+| `hit` | 行键落在已审计叶页范围内，且存在精确单元 |
+| `leaf_miss` | 行键在叶页范围内但无精确单元（叶内缺失）；仍给出路径、叶页与完整行键范围 |
+| `out_of_range` | 行键在全树范围之外；`path` 为空、`leaf` 为 null |
+| `no_leaf` | 行键位于两条分隔边界之间、没有对应叶页；`path` 为空、`leaf` 为 null |
+
 ## 错误码
 
 | 代码 | 含义 |
@@ -122,6 +169,12 @@ rowid 7 携带 2500 字节 BLOB，恰好溢出到 6、7 两页；空闲干页 8 
 违规快照逐一构造：共享溢出页、祖先回指、键界越界、活页进入空闲干链、
 截断单元、根页越界、溢出链截断/超长、空闲链计数不符及各类头部违规；
 每个场景断言接口与页面展示同一首个违规证据（错误码、页面号、偏移一致）。
+
+行键路径查询验收：另构造叶内带空洞、叶间带间隔的合法快照
+（`gapped_snapshot`：叶 3 缺 3、叶 4 自 6 起、叶 5 缺 11），冒烟覆盖
+多级树命中（rowid 7 → 页 2→11→4，含键界与指针偏移核对）、叶内缺失
+（rowid 11）、分隔边界间无叶（rowid 5）、树外查询（rowid 500 / -4），
+以及旧结论失效（提交另一份快照或失败裁决后查询返回 404）。
 
 ## 布局
 

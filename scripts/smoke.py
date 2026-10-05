@@ -4,7 +4,10 @@
 Submits the valid multi-level snapshot and every crafted violation scenario
 to a running service, checks the health endpoint, verifies that the HTML page
 shows the same first-violation evidence as the JSON API, and confirms that a
-failed review clears the previous success conclusion.
+failed review clears the previous success conclusion.  It then exercises the
+row-key path query endpoint: multi-level hits, in-leaf misses, keys outside
+the tree range, gaps between divider bounds, and stale-conclusion
+invalidation after another submission or a failed review.
 
 Exits 0 when every check passes, 1 otherwise.
 """
@@ -43,6 +46,20 @@ def get(path):
             return resp.status, resp.read()
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read()
+
+
+def get_json(path):
+    status, body = get(path)
+    try:
+        return status, json.loads(body)
+    except ValueError:
+        return status, {}
+
+
+def result_section(html_text):
+    """The server-rendered verdict section (the page's JS also mentions the
+    query-entry markup, so entry checks must be scoped to this section)."""
+    return html_text.split('<section id="result">', 1)[1].split("</section>", 1)[0]
 
 
 def post_json(payload):
@@ -142,6 +159,103 @@ def main():
         and last.get("verdict") == "rejected"
         and last["error"]["code"] == scenarios["bad_magic"][2],
         f"last={last.get('error')}",
+    )
+
+    # --- row-key path queries on the latest accepted conclusion ------------
+    data, root = valid_snapshot()
+    status, res = post_json({"snapshot_b64": b64(data), "root_page": root})
+    check("path: valid snapshot accepted",
+          status == 200 and res.get("verdict") == "accepted",
+          f"status={status} error={res.get('error')}")
+
+    status, html_text = post_form({"snapshot_b64": b64(data), "root_page": str(root)})
+    check(
+        "path: accepted page offers query entry",
+        status == 200
+        and 'id="path-query"' in result_section(html_text)
+        and 'id="rowid-input"' in result_section(html_text),
+    )
+
+    status, res = get_json("/api/audit/last/path?rowid=7")
+    ok = (
+        status == 200
+        and res.get("conclusion") == "hit"
+        and [s["page"] for s in res["path"]] == [2, 11]
+        and [s["child_page"] for s in res["path"]] == [11, 4]
+        and res["path"][0]["via"] == "cell"
+        and res["path"][0]["key_lower"] is None
+        and res["path"][0]["key_upper"] == 8
+        and res["path"][1]["via"] == "rightmost"
+        and res["path"][1]["key_lower"] == 4
+        and res["path"][1]["key_upper"] is None
+        and res["leaf"] == {"page": 4, "rowid_range": [5, 8], "exact_cell": True}
+    )
+    check("path: multi-level hit reaches leaf 4", ok, f"res={res}")
+    ok = all(
+        isinstance(s["pointer_offset"], int)
+        and int.from_bytes(data[s["pointer_offset"] : s["pointer_offset"] + 4], "big")
+        == s["child_page"]
+        for s in res["path"]
+    )
+    check("path: step offsets point at raw child pointers", ok)
+
+    status, res = get_json("/api/audit/last/path?rowid=500")
+    check(
+        "path: out-of-tree high key misses without path",
+        status == 200
+        and res.get("conclusion") == "out_of_range"
+        and res["path"] == []
+        and res["leaf"] is None,
+        f"res={res}",
+    )
+    status, res = get_json("/api/audit/last/path?rowid=-4")
+    check(
+        "path: out-of-tree negative key misses without path",
+        status == 200
+        and res.get("conclusion") == "out_of_range"
+        and res["path"] == []
+        and res["leaf"] is None,
+        f"res={res}",
+    )
+
+    # Submitting another snapshot replaces the previous conclusions.
+    gdata, groot = fixtures.gapped_snapshot()
+    status, res = post_json({"snapshot_b64": b64(gdata), "root_page": groot})
+    check("path: gapped snapshot accepted",
+          status == 200 and res.get("verdict") == "accepted",
+          f"status={status} error={res.get('error')}")
+
+    status, res = get_json("/api/audit/last/path?rowid=11")
+    check(
+        "path: in-leaf miss keeps leaf range",
+        status == 200
+        and res.get("conclusion") == "leaf_miss"
+        and res["leaf"] == {"page": 5, "rowid_range": [9, 12], "exact_cell": False}
+        and [s["page"] for s in res["path"]] == [2],
+        f"res={res}",
+    )
+
+    status, res = get_json("/api/audit/last/path?rowid=5")
+    check(
+        "path: gap between dividers has no leaf (old conclusion replaced)",
+        status == 200
+        and res.get("conclusion") == "no_leaf"
+        and res["path"] == []
+        and res["leaf"] is None,
+        f"res={res}",
+    )
+
+    # A failed review invalidates the stored paths.
+    bad, bad_root, code, page, offset = scenarios["bad_magic"]
+    status, res = post_json({"snapshot_b64": b64(bad), "root_page": bad_root})
+    check("path: failing snapshot rejected", status == 422)
+    status, res = get_json("/api/audit/last/path?rowid=7")
+    check("path: failed review invalidates stored paths", status == 404,
+          f"status={status}")
+    status, html_text = post_form({"snapshot_b64": b64(bad), "root_page": str(bad_root)})
+    check(
+        "path: rejected page has no query entry",
+        status == 422 and 'id="path-query"' not in result_section(html_text),
     )
 
     print(f"\n{len(_failures)} failure(s)" if _failures else "\nall smoke checks passed")

@@ -6,9 +6,13 @@ Endpoints:
   POST /                 form submit, server-rendered verdict (HTML)
   POST /api/audit        JSON {snapshot_b64, root_page} -> verdict JSON
   GET  /api/audit/last   most recent verdict (404 before the first submission)
+  GET  /api/audit/last/path?rowid=N
+                         root-to-leaf path for a row key, resolved solely from
+                         the most recent *accepted* verdict (404 when none is
+                         stored, e.g. after a failed review)
 
 Every submission atomically replaces the stored verdict, so a failed review
-always clears any earlier success conclusion.
+always clears any earlier success conclusion along with its row-key paths.
 """
 
 from __future__ import annotations
@@ -18,11 +22,16 @@ import binascii
 import html
 import json
 import os
+import re
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from .sqlite_audit import MAX_SNAPSHOT_BYTES, audit_snapshot
+from .sqlite_audit import (
+    MAX_SNAPSHOT_BYTES,
+    audit_snapshot_with_index,
+    resolve_rowid_path,
+)
 
 MAX_BODY_BYTES = 2 * 1024 * 1024
 # Largest base64 string that can decode to <= MAX_SNAPSHOT_BYTES.
@@ -30,6 +39,9 @@ MAX_B64_CHARS = ((MAX_SNAPSHOT_BYTES + 2) // 3) * 4 + 8
 
 _lock = threading.Lock()
 _last_result: dict | None = None
+# Route index of the most recent accepted verdict; None whenever the latest
+# submission did not pass review, so stale paths are never served.
+_last_index: dict | None = None
 
 
 def _rejected(code, message):
@@ -51,40 +63,52 @@ def _rejected(code, message):
     }
 
 
-def evaluate(snapshot_b64, root_page) -> dict:
-    """Decode inputs and run the audit; always returns a verdict dict."""
+def evaluate_with_index(snapshot_b64, root_page) -> tuple[dict, dict | None]:
+    """Decode inputs and run the audit; returns (verdict dict, route index).
+
+    The route index is only present when the snapshot passed review.
+    """
     if not isinstance(snapshot_b64, str) or not snapshot_b64.strip():
-        return _rejected("SNAPSHOT_MISSING", "snapshot_b64 is required")
+        return _rejected("SNAPSHOT_MISSING", "snapshot_b64 is required"), None
     compact = "".join(snapshot_b64.split())
     if len(compact) > MAX_B64_CHARS:
         return _rejected(
             "SNAPSHOT_TOO_LARGE",
             f"base64 payload exceeds the {MAX_SNAPSHOT_BYTES}-byte snapshot budget",
-        )
+        ), None
     try:
         data = base64.b64decode(compact, validate=True)
     except (binascii.Error, ValueError) as exc:
-        return _rejected("BASE64_INVALID", f"snapshot is not valid base64: {exc}")
+        return _rejected("BASE64_INVALID", f"snapshot is not valid base64: {exc}"), None
     if len(data) > MAX_SNAPSHOT_BYTES:
         return _rejected(
             "SNAPSHOT_TOO_LARGE",
             f"decoded snapshot is {len(data)} bytes; the limit is {MAX_SNAPSHOT_BYTES}",
-        )
+        ), None
     try:
         root = int(root_page)
     except (TypeError, ValueError):
-        return _rejected("ROOT_PAGE_INVALID", "root_page must be an integer")
+        return _rejected("ROOT_PAGE_INVALID", "root_page must be an integer"), None
     if root < 1:
-        return _rejected("ROOT_PAGE_INVALID", "root_page must be >= 1")
-    return audit_snapshot(data, root)
+        return _rejected("ROOT_PAGE_INVALID", "root_page must be >= 1"), None
+    return audit_snapshot_with_index(data, root)
+
+
+def evaluate(snapshot_b64, root_page) -> dict:
+    """Decode inputs and run the audit; always returns a verdict dict."""
+    result, _index = evaluate_with_index(snapshot_b64, root_page)
+    return result
 
 
 def run_audit(snapshot_b64, root_page) -> dict:
     """Evaluate and atomically replace the stored verdict (clears stale success)."""
-    global _last_result
-    result = evaluate(snapshot_b64, root_page)
+    global _last_result, _last_index
+    result, index = evaluate_with_index(snapshot_b64, root_page)
     with _lock:
         _last_result = result
+        # The route index exists only for accepted verdicts, so a rejection
+        # or a newer snapshot atomically retires every earlier path.
+        _last_index = index
     return result
 
 
@@ -93,8 +117,23 @@ def last_result() -> dict | None:
         return _last_result
 
 
+def last_path_index() -> dict | None:
+    with _lock:
+        return _last_index
+
+
 # ---------------------------------------------------------------------------
 # HTML rendering
+
+# Row-key query entry shown on accepted verdicts (server-rendered and
+# JS-rendered pages share this exact markup; the query itself always goes
+# through GET /api/audit/last/path).
+PATH_QUERY_HTML = (
+    '<div id="path-query"><h3>行键路径查询</h3>'
+    '<p>行键：<input id="rowid-input" inputmode="numeric" size="12"> '
+    '<button type="button" onclick="queryPath()">查询路径</button></p>'
+    '<div id="path-result"></div></div>'
+)
 
 
 def render_result_html(result: dict | None) -> str:
@@ -143,6 +182,8 @@ def render_result_html(result: dict | None) -> str:
                 f"<td>{esc(p['referenced_by'])}</td><td>{esc(rng_text)}</td></tr>"
             )
         out.append("</tbody></table>")
+    if verdict == "accepted":
+        out.append(PATH_QUERY_HTML)
     out.append("</section>")
     return "".join(out)
 
@@ -177,6 +218,21 @@ __RESULT__
 <script>
 const esc = s => String(s).replace(/[&<>"']/g,
   c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const PATH_QUERY_HTML = '<div id="path-query"><h3>行键路径查询</h3>'
+  + '<p>行键：<input id="rowid-input" inputmode="numeric" size="12"> '
+  + '<button type="button" onclick="queryPath()">查询路径</button></p>'
+  + '<div id="path-result"></div></div>';
+const CONCLUSION_LABELS = {
+  hit: '命中：叶页内存在精确单元',
+  leaf_miss: '叶内缺失：行键位于叶页范围内，但无精确单元',
+  out_of_range: '未命中：行键位于全树范围之外',
+  no_leaf: '未命中：行键位于分隔边界之间，无对应叶页',
+};
+function fmtBounds(lower, upper) {
+  const l = lower === null ? '-∞' : String(lower);
+  const u = upper === null ? '+∞' : String(upper);
+  return '(' + l + ', ' + u + (upper === null ? ')' : ']');
+}
 function renderResult(res) {
   let h = `<h2>裁决：<span id="verdict" class="verdict-${res.verdict}">${esc(res.verdict)}</span></h2>`;
   if (res.error) {
@@ -195,7 +251,41 @@ function renderResult(res) {
     }
     h += '</tbody></table>';
   }
+  if (res.verdict === 'accepted') h += PATH_QUERY_HTML;
   document.getElementById('result').innerHTML = h;
+}
+async function queryPath() {
+  const raw = document.getElementById('rowid-input').value.trim();
+  const resp = await fetch('/api/audit/last/path?rowid=' + encodeURIComponent(raw));
+  renderPath(await resp.json());
+}
+function renderPath(res) {
+  const el = document.getElementById('path-result');
+  if (!el) return;
+  if (res.error) {
+    el.innerHTML = '<p id="path-error">' + esc(res.error) + '</p>';
+    return;
+  }
+  let h = '<p id="path-conclusion">' + esc(CONCLUSION_LABELS[res.conclusion] || res.conclusion) + '</p>';
+  if (res.path && res.path.length) {
+    h += '<table id="path-table"><thead><tr>'
+      + '<th>当前页</th><th>采用的子页指针</th><th>键界（下界排他，上界包含）</th><th>指针偏移</th>'
+      + '</tr></thead><tbody>';
+    for (const s of res.path) {
+      const via = s.via === 'rightmost'
+        ? '最右指针 → 页 ' + s.child_page
+        : '单元 ' + s.cell_index + '（分隔键 ' + s.divider_key + '）→ 页 ' + s.child_page;
+      h += '<tr><td>' + s.page + '</td><td>' + esc(via) + '</td><td>'
+        + esc(fmtBounds(s.key_lower, s.key_upper)) + '</td><td>' + s.pointer_offset + '</td></tr>';
+    }
+    h += '</tbody></table>';
+  }
+  if (res.leaf) {
+    h += '<p id="path-leaf">叶页 ' + res.leaf.page
+      + '，完整行键范围 ' + res.leaf.rowid_range[0] + '..' + res.leaf.rowid_range[1]
+      + '，精确单元：' + (res.leaf.exact_cell ? '是' : '否') + '</p>';
+  }
+  el.innerHTML = h;
 }
 document.getElementById('audit-form').addEventListener('submit', async (ev) => {
   ev.preventDefault();
@@ -257,8 +347,28 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"error": "no audit submitted yet"}, 404)
             else:
                 self._send_json(result)
+        elif path == "/api/audit/last/path":
+            self._handle_path_query()
         else:
             self._send_json({"error": "not found"}, 404)
+
+    def _handle_path_query(self):
+        params = parse_qs(urlparse(self.path).query)
+        raw = (params.get("rowid") or [""])[0].strip()
+        if not raw:
+            self._send_json({"error": "rowid query parameter is required"}, 400)
+            return
+        if not re.fullmatch(r"[+-]?[0-9]+", raw):
+            self._send_json({"error": "rowid must be an integer"}, 400)
+            return
+        index = last_path_index()
+        if index is None:
+            self._send_json(
+                {"error": "no accepted audit conclusion available for path queries"},
+                404,
+            )
+            return
+        self._send_json(resolve_rowid_path(index, int(raw)))
 
     def do_POST(self):
         path = urlparse(self.path).path

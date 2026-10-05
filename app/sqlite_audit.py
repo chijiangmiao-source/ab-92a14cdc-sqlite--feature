@@ -13,10 +13,16 @@ file-format subset needed for that proof is parsed:
 
 The first violation stops the audit and is reported with a stable page
 number, absolute file offset and the raw bytes found there.
+
+An accepted audit additionally exposes a row-key route index (divider keys
+and child-pointer offsets captured during the walk) so a reviewer can trace
+the exact root-to-leaf path SQLite would follow for any rowid, instead of
+inferring record placement from summary rowid ranges alone.
 """
 
 from __future__ import annotations
 
+import bisect
 import sys
 from dataclasses import dataclass, field
 
@@ -131,6 +137,10 @@ class Auditor:
         # overflow page pointing at any b-tree page is a deterministic
         # ownership conflict regardless of traversal order.
         self.pending_overflow: list[tuple] = []
+        # Row-key routing data captured while walking the b-tree.  It is only
+        # exposed through route_index() when the whole audit is accepted.
+        self.interior_routes: dict[int, dict] = {}
+        self.leaf_rowids: dict[int, list[int]] = {}
 
     # -- low-level helpers ------------------------------------------------
 
@@ -406,6 +416,7 @@ class Auditor:
     def _parse_leaf(self, pgno, owner, cells, page_end):
         prev = None
         lo = hi = None
+        rowids = []
         for i, coff in enumerate(cells):
             payload_len, o = self.read_varint(
                 coff, page_end, pgno, f"cell {i} payload length"
@@ -446,11 +457,13 @@ class Auditor:
                     },
                 )
             prev = rowid
+            rowids.append(rowid)
             if lo is None:
                 lo = rowid
             hi = rowid
         owner.rowid_min = lo
         owner.rowid_max = hi
+        self.leaf_rowids[pgno] = rowids
         return (lo, hi, len(cells))
 
     def _parse_interior(self, pgno, owner, cells, hdr, page_end, depth):
@@ -471,6 +484,21 @@ class Auditor:
             )
             entries.append((child, to_signed64(key_raw), coff, coff + 4))
         children = [e[0] for e in entries] + [right_ptr]
+        # Remember how SQLite routes row keys through this page: each cell's
+        # child pointer (with its divider key and raw file offset) and the
+        # right-most pointer.  Only exposed when the whole audit is accepted.
+        self.interior_routes[pgno] = {
+            "cells": [
+                {
+                    "child": child,
+                    "key": key,
+                    "pointer_offset": child_off,
+                    "key_offset": key_off,
+                }
+                for child, key, child_off, key_off in entries
+            ],
+            "right": {"child": right_ptr, "pointer_offset": hdr + 8},
+        }
 
         ranges = []
         for i, (child, key, child_off, key_off) in enumerate(entries):
@@ -686,6 +714,25 @@ class Auditor:
 
     # -- result -------------------------------------------------------------------
 
+    def route_index(self) -> dict:
+        """Row-key routing tables captured during the walk (accepted audits)."""
+        root = self.owners[self.root_page]
+        leaves = {}
+        for pgno, rowids in self.leaf_rowids.items():
+            leaves[pgno] = {
+                "rowid_range": [rowids[0], rowids[-1]] if rowids else None,
+                "rowids": rowids,
+            }
+        return {
+            "root_page": self.root_page,
+            "page_size": self.page_size,
+            "page_count": self.page_count,
+            "rowid_min": root.rowid_min,
+            "rowid_max": root.rowid_max,
+            "interior": self.interior_routes,
+            "leaves": leaves,
+        }
+
     def result(self, verdict, error):
         pages = [self.owners[p].to_dict() for p in sorted(self.owners)]
         counts: dict[str, int] = {}
@@ -715,8 +762,95 @@ class Auditor:
         }
 
 
-def audit_snapshot(data: bytes, root_page: int) -> dict:
-    """Audit one snapshot; returns the verdict dict (accepted/rejected)."""
+def resolve_rowid_path(index: dict, rowid: int) -> dict:
+    """Resolve the root-to-leaf path SQLite would follow for `rowid`.
+
+    Uses only the route index captured by an accepted audit.  Each path step
+    names the current page, the child pointer taken (divider cell or
+    right-most pointer), the half-open key bounds ``(key_lower, key_upper]``
+    formed by the adjacent divider keys (``None`` = unbounded) and the
+    pointer's raw file offset in the snapshot.
+
+    Misses never fabricate a path: keys outside the whole tree range and
+    keys falling between divider bounds with no covering leaf return an
+    empty path and a null leaf with a distinguishable conclusion.
+    """
+    lo = index["rowid_min"]
+    hi = index["rowid_max"]
+    result = {
+        "root_page": index["root_page"],
+        "rowid": rowid,
+        "tree_rowid_range": [lo, hi] if lo is not None else None,
+        "conclusion": None,
+        "path": [],
+        "leaf": None,
+    }
+    if lo is None or rowid < lo or rowid > hi:
+        result["conclusion"] = "out_of_range"
+        return result
+
+    path = []
+    pgno = index["root_page"]
+    interior = index["interior"]
+    while pgno in interior:
+        route = interior[pgno]
+        kind = KIND_ROOT if pgno == index["root_page"] else KIND_INTERIOR
+        lower = None
+        descended = False
+        for cell_index, cell in enumerate(route["cells"]):
+            if rowid <= cell["key"]:
+                path.append(
+                    {
+                        "page": pgno,
+                        "page_kind": kind,
+                        "via": "cell",
+                        "cell_index": cell_index,
+                        "divider_key": cell["key"],
+                        "child_page": cell["child"],
+                        "pointer_offset": cell["pointer_offset"],
+                        "key_lower": lower,
+                        "key_upper": cell["key"],
+                    }
+                )
+                pgno = cell["child"]
+                descended = True
+                break
+            lower = cell["key"]
+        if descended:
+            continue
+        right = route["right"]
+        path.append(
+            {
+                "page": pgno,
+                "page_kind": kind,
+                "via": "rightmost",
+                "cell_index": None,
+                "divider_key": None,
+                "child_page": right["child"],
+                "pointer_offset": right["pointer_offset"],
+                "key_lower": lower,
+                "key_upper": None,
+            }
+        )
+        pgno = right["child"]
+
+    leaf = index["leaves"].get(pgno)
+    rng = leaf["rowid_range"] if leaf else None
+    if rng is None or not (rng[0] <= rowid <= rng[1]):
+        # The key sits between two divider bounds with no leaf covering it.
+        result["conclusion"] = "no_leaf"
+        return result
+    rowids = leaf["rowids"]
+    pos = bisect.bisect_left(rowids, rowid)
+    exact = pos < len(rowids) and rowids[pos] == rowid
+    result["conclusion"] = "hit" if exact else "leaf_miss"
+    result["path"] = path
+    result["leaf"] = {"page": pgno, "rowid_range": rng, "exact_cell": exact}
+    return result
+
+
+def audit_snapshot_with_index(data: bytes, root_page: int) -> tuple[dict, dict | None]:
+    """Audit one snapshot; also returns the row-key route index when accepted."""
     auditor = Auditor(data, root_page)
     try:
         auditor.parse_header()
@@ -724,5 +858,11 @@ def audit_snapshot(data: bytes, root_page: int) -> dict:
         auditor.walk_pending_overflow()
         auditor.walk_freelist()
     except Reject as reject:
-        return auditor.result("rejected", reject.error)
-    return auditor.result("accepted", None)
+        return auditor.result("rejected", reject.error), None
+    return auditor.result("accepted", None), auditor.route_index()
+
+
+def audit_snapshot(data: bytes, root_page: int) -> dict:
+    """Audit one snapshot; returns the verdict dict (accepted/rejected)."""
+    result, _index = audit_snapshot_with_index(data, root_page)
+    return result

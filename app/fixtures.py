@@ -211,6 +211,29 @@ def valid_snapshot():
     return b.build(), ROOT_PAGE
 
 
+def gapped_snapshot():
+    """Accepted multi-level snapshot with row-key gaps for path queries.
+
+    Same page layout as valid_snapshot() but without the overflow chain:
+      3  table leaf   rowids 1,2,4   (in-leaf gap at 3)
+      4  table leaf   rowids 6,7,8   (divider 4 < min 6: no leaf covers 5)
+      5  table leaf   rowids 9,10,12 (in-leaf gap at 11)
+      11 table interior, divider key 4 -> children 3,4
+      2  table root, divider key 8 -> interior 11 and leaf 5
+    """
+    b = SnapshotBuilder()
+    b.add_table_leaf(1, [(1, b"sqlite-master placeholder record")], first_page=True)
+    b.add_table_leaf(3, [(1, b"tm-0001"), (2, b"tm-0002"), (4, b"tm-0004")])
+    b.add_table_leaf(4, [(6, b"tm-0006"), (7, b"tm-0007"), (8, b"tm-0008")])
+    b.add_table_leaf(5, [(9, b"tm-0009"), (10, b"tm-0010"), (12, b"tm-0012")])
+    b.add_table_interior(11, [4], [3, 4])
+    b.add_table_interior(2, [8], [11, 5])
+    b.add_freelist_trunk(8, 0, [9, 10])
+    b.freelist_head = 8
+    b.freelist_count = 3
+    return b.build(), ROOT_PAGE
+
+
 def invalid_scenarios():
     """name -> (snapshot, root_page, expected_code, expected_page, expected_offset).
 
